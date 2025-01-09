@@ -1,8 +1,10 @@
 use rdev::{listen, Event, EventType};
 use serde::{Serialize, Deserialize};
 use std::sync::{Arc, Mutex};
+use tokio::time::{interval, Duration};
+mod db;
 
-#[derive(Debug, Serialize, Deserialize, Default)] // Add capabilities to the struct
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct DataFrame {
     m: i64,     // Minute since last epoch
     lc: i32,    // Left-click counter
@@ -67,21 +69,59 @@ impl EventCounter {
 
 
 // Main program function
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("Starting Slime Watcher...");
+
+    // Connect to MongoDB
+    let client = db::connect_to_mongodb()
+        .await // Wait for connection
+        .expect("Failed to connect to MongoDB"); // Handle errors
 
     // Creating a thread-safe counter
     let counter = Arc::new(Mutex::new(EventCounter::new()));
-    let counter_close = counter.clone(); // Clone for use in event listener
+    let counter_clone = counter.clone();
+    let counter_save = counter.clone();
 
     // Setting the initial minute
     if let Ok(mut guard) = counter.lock() {
         guard.frame.m = chrono::Utc::now().timestamp() / 60;
     }
 
+    // Spawn periodic save task
+    let client_clone = client.clone();
+    tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(60));
+        
+        loop {
+            interval.tick().await;
+            // Create a new scope for the guard
+            let frame = {
+                // Get the frame data and drop the guard immediately
+                let mut guard = counter_save.lock().expect("Failed to lock counter");
+                // Update the minute timestamp
+                guard.frame.m = chrono::Utc::now().timestamp() / 60;
+                guard.frame.clone()  // Clone the frame data
+            }; // MutexGuard is dropped here
+            
+            // Now we can safely await
+            if let Err(e) = db::save_to_mongodb(&client_clone, &frame).await {
+                eprintln!("Failed to save to MongoDB: {}", e);
+            } else {
+                if let Ok(mut guard) = counter_save.lock() {
+                    guard.frame.lc = 0;
+                    guard.frame.rc = 0;
+                    guard.frame.mc = 0;
+                    guard.frame.ks = 0;
+                    guard.frame.mm = 0;
+                }
+            }
+        }
+    });
+
     // Starting the event listener
     if let Err(err) = listen(move |event| {
-        if let Ok(mut guard) = counter_close.lock() {
+        if let Ok(mut guard) = counter_clone.lock() {
             guard.update_from_event(&event);
         }
     }) {
