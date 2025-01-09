@@ -66,8 +66,6 @@ impl EventCounter {
     }
 }
 
-
-
 // Main program function
 #[tokio::main]
 async fn main() {
